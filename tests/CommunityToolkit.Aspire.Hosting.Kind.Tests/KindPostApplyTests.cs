@@ -235,6 +235,66 @@ public class KindPostApplyTests
         Assert.Equal(helm ? 3 : 2, runner.Commands.Count);
     }
 
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(false, true, true)]
+    [InlineData(true, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(true, true, true)]
+    public async Task ClientCreationFailureRespectsCrdWaitPolicy(bool helm, bool bestEffort, bool invalidConfig)
+    {
+        var runner = new FakeProcessRunner();
+        if (helm)
+        {
+            runner.Results.Enqueue(new(0, "", ""));
+            runner.Results.Enqueue(new(0, "release installed", ""));
+        }
+        else
+        {
+            runner.Results.Enqueue(new(0, "cluster is running", ""));
+        }
+        runner.Results.Enqueue(new(0, "customresourcedefinition.apiextensions.k8s.io/widgets.example.com", ""));
+        using var builder = TestDistributedApplicationBuilder.Create();
+        var resource = AddDeployment(builder, helm);
+        if (bestEffort)
+        {
+            builder.CreateResourceBuilder(resource)
+                .WithCrdWait(options => options.FailureBehavior = CrdWaitBehavior.BestEffort);
+        }
+        builder.Services.AddSingleton<IProcessRunner>(runner);
+        Exception factoryError = invalidConfig
+            ? new InvalidOperationException("Invalid kubeconfig")
+            : new FileNotFoundException("Missing kubeconfig");
+        builder.Services.AddSingleton<Func<string, IKubernetes>>(_ => _ =>
+            throw factoryError);
+        using var app = builder.Build();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(15));
+
+        await app.StartAsync(cts.Token);
+        var notifications = app.Services.GetRequiredService<ResourceNotificationService>();
+        await notifications.WaitForResourceAsync(resource.Name,
+            [KnownResourceStates.Running, KnownResourceStates.FailedToStart], cts.Token);
+        Assert.True(notifications.TryGetCurrentState(resource.Name, out var current));
+        Assert.Equal(bestEffort ? KnownResourceStates.Running : KnownResourceStates.FailedToStart,
+            current.Snapshot.State?.Text);
+
+        if (bestEffort)
+        {
+            var loggerService = app.Services.GetRequiredService<ResourceLoggerService>();
+            await foreach (var batch in loggerService.WatchAsync(resource.Name).WithCancellation(cts.Token))
+            {
+                if (batch.Any(log => log.Content.Contains("CRD readiness is unverified", StringComparison.Ordinal)
+                    && log.Content.Contains(resource.Name)))
+                {
+                    return;
+                }
+            }
+            Assert.Fail("Expected an unverified CRD readiness warning.");
+        }
+    }
+
     [Fact]
     public async Task BestEffortWarnsThatCrdReadinessIsUnverifiedBeforeRunning()
     {

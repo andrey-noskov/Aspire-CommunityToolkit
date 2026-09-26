@@ -49,7 +49,20 @@ internal sealed class KindCrdEstablishmentCheck(
             "Waiting for {CrdCount} custom resource definition(s) to become Established...",
             remainingNames.Count);
 
-        IKubernetes client = _kubernetesFactory(resource.Parent.KubeconfigPath);
+        IKubernetes client;
+        try
+        {
+            client = _kubernetesFactory(resource.Parent.KubeconfigPath);
+        }
+        catch (Exception exception) when (failureBehavior == CrdWaitBehavior.BestEffort
+            && !cancellationToken.IsCancellationRequested && exception is not OperationCanceledException)
+        {
+            logger.LogWarning(exception,
+                "CRD readiness is unverified for deployment '{DeploymentName}' (BestEffort).",
+                resource.Name);
+            return;
+        }
+
         using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         waitCts.CancelAfter(timeout);
         Task<(string Name, V1CustomResourceDefinition? Definition)>[]? activeReads = null;
